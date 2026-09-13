@@ -2,6 +2,8 @@
 name = "rust_vault"
 version = "0.1.0"
 edition = "2021"
+description = "IronVault Enterprise encrypted archive utility"
+license = "MIT"
 
 [dependencies]
 gtk4 = "0.9"
@@ -30,7 +32,6 @@ features = ["bundled-sqlcipher-vendored-openssl", "uuid"]
 name = "ironvault"
 maintainer = "likithsai <likithsai@example.com>"
 copyright = "2026, likithsai"
-license-file = ["LICENSE", "4"]
 extended-description = "IronVault Pro Secure Encrypted Archive Utility"
 depends = "$auto, libgtk-4-1"
 section = "utils"

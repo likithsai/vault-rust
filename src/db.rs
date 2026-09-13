@@ -21,6 +21,7 @@ impl fmt::Debug for EncryptedDb {
 pub struct FolderMetadata {
     pub id: Uuid,
     pub name: String,
+    #[allow(dead_code)]
     pub parent_id: Option<Uuid>,
 }
 
@@ -31,6 +32,7 @@ pub struct FileMetadata {
     pub size: usize,
     pub compressed_size: usize,
     pub created_at: i64,
+    #[allow(dead_code)]
     pub folder_id: Option<Uuid>,
     pub checksum: String,
 }
