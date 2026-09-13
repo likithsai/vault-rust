@@ -1,0 +1,119 @@
+[config]
+skip_core_tasks = true
+
+# -----------------------------------------------------------------------------
+# Default task (run with `cargo make`)
+# -----------------------------------------------------------------------------
+[tasks.default]
+alias = "dev"
+
+# -----------------------------------------------------------------------------
+# Development & Testing
+# -----------------------------------------------------------------------------
+[tasks.dev]
+description = "Build and run IronVault locally in development mode"
+command = "cargo"
+args = ["run"]
+
+[tasks.check]
+description = "Check project compilation and Clippy lints"
+command = "cargo"
+args = ["clippy", "--all-targets", "--", "-D", "warnings"]
+
+[tasks.fmt]
+description = "Format Rust source files"
+command = "cargo"
+args = ["fmt"]
+
+[tasks.clean]
+description = "Clean build artifacts and release directories"
+command = "cargo"
+args = ["clean"]
+
+# -----------------------------------------------------------------------------
+# Production Build
+# -----------------------------------------------------------------------------
+[tasks.build-release]
+description = "Compile an optimized release binary"
+command = "cargo"
+args = ["build", "--release"]
+
+# -----------------------------------------------------------------------------
+# Local Platform Packaging Tasks
+# -----------------------------------------------------------------------------
+
+# --- macOS (.dmg) ---
+[tasks.package-macos]
+description = "Build and create a .dmg installer image for macOS"
+dependencies = ["build-release"]
+condition = { platforms = ["mac"] }
+script_runner = "@shell"
+script = [
+    '''
+    mkdir -p dist/dmg_root
+    cp target/release/rust_vault dist/dmg_root/IronVault
+    chmod +x dist/dmg_root/IronVault
+    if which create-dmg > /dev/null; then
+        rm -f dist/IronVault-macOS.dmg
+        create-dmg \
+            --volname "IronVault Installer" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --app-drop-link 450 185 \
+            "dist/IronVault-macOS.dmg" \
+            "dist/dmg_root/" || true
+        echo "Installer created at dist/IronVault-macOS.dmg"
+    else
+        echo "Warning: 'create-dmg' not found. Run 'brew install create-dmg' to build DMGs."
+    fi
+    '''
+]
+
+# --- Linux (.deb) ---
+[tasks.package-linux]
+description = "Package a Debian/Ubuntu .deb installer"
+dependencies = ["build-release"]
+condition = { platforms = ["linux"] }
+script_runner = "@shell"
+script = [
+    '''
+    if which cargo-deb > /dev/null; then
+        cargo deb --no-build
+        mkdir -p dist
+        cp target/debian/*.deb dist/
+        echo "Debian package created in dist/"
+    else
+        echo "Warning: 'cargo-deb' not found. Run 'cargo install cargo-deb' to build .deb packages."
+    fi
+    '''
+]
+
+# --- Windows (.zip distribution) ---
+[tasks.package-windows]
+description = "Package Windows standalone executable with runtime DLLs"
+dependencies = ["build-release"]
+condition = { platforms = ["windows"] }
+script_runner = "powershell"
+script = [
+    '''
+    New-Item -ItemType Directory -Force -Path dist\win_pkg | Out-Null
+    Copy-Item target\release\rust_vault.exe dist\win_pkg\IronVault.exe
+    if (Test-Path "C:\msys64\ucrt64\bin") {
+        Copy-Item C:\msys64\ucrt64\bin\*.dll dist\win_pkg\ -ErrorAction SilentlyContinue
+    }
+    Compress-Archive -Path dist\win_pkg\* -DestinationPath dist\IronVault-Windows.zip -Force
+    Write-Host "Windows package created at dist\IronVault-Windows.zip"
+    '''
+]
+
+# -----------------------------------------------------------------------------
+# Universal Unified Package Task
+# -----------------------------------------------------------------------------
+[tasks.package]
+description = "Detect current OS and build the native installer package"
+dependencies = [
+    "package-macos",
+    "package-linux",
+    "package-windows"
+]
