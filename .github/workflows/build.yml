@@ -3,10 +3,16 @@ name: IronVault Build & Package Installers
 on:
   push:
     branches:
-      - main
+      - 'release'
+      - 'release/**'
+      - 'release-*'
+    tags:
+      - 'v*'
   pull_request:
     branches:
-      - main
+      - 'release'
+      - 'release/**'
+      - 'release-*'
 
 permissions:
   contents: write
