@@ -24,37 +24,30 @@ jobs:
           - os: macos-latest
             artifact_name: ironvault-macos
             package_path: IronVault-macOS.dmg
+            target: x86_64-apple-darwin
           - os: ubuntu-latest
             artifact_name: ironvault-linux
             package_path: target/debian/*.deb
+            target: x86_64-unknown-linux-gnu
           - os: windows-latest
             artifact_name: ironvault-windows
             package_path: IronVault-Windows.zip
+            target: x86_64-pc-windows-gnu
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # --- Install Rust Toolchain with target ---
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          targets: ${{ matrix.target }}
 
       # ------------------------------------------------------------------------
-      # 1. macOS Build & DMG Package
+      # 1. macOS Build & Packaging
       # ------------------------------------------------------------------------
-      - name: Install GTK4 & Packaging Tools on macOS
+      - name: Install macOS Dependencies
         if: runner.os == 'macOS'
         run: |
           brew install gtk4 pkg-config create-dmg
@@ -79,17 +72,19 @@ jobs:
             "dmg_root/" || true
 
       # ------------------------------------------------------------------------
-      # 2. Linux Build & DEB Package
+      # 2. Linux Build & Packaging
       # ------------------------------------------------------------------------
-      - name: Install GTK4 on Linux
+      - name: Install Linux Dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev build-essential pkg-config libssl-dev
+          sudo apt-get install -y libgtk-4-dev build-essential pkg-config libssl-dev libvulkan-dev
 
-      - name: Install cargo-deb tool
+      - name: Install pre-built cargo-deb
         if: runner.os == 'Linux'
-        run: cargo install cargo-deb || true
+        run: |
+          curl -LsSf https://github.com/cargo-bins/cargo-binstall/releases/latest/download/cargo-binstall-x86_64-unknown-linux-musl.tgz | tar -xvz -C /usr/local/bin
+          cargo-binstall -y --no-confirm cargo-deb
 
       - name: Build and Package .deb on Linux
         if: runner.os == 'Linux'
@@ -98,7 +93,7 @@ jobs:
           cargo deb --no-build
 
       # ------------------------------------------------------------------------
-      # 3. Windows Build & Portable ZIP Package
+      # 3. Windows Build & Packaging (MSYS2 + GNU toolchain)
       # ------------------------------------------------------------------------
       - name: Set up MSYS2 on Windows
         if: runner.os == 'Windows'
@@ -111,23 +106,20 @@ jobs:
             mingw-w64-ucrt-x86_64-toolchain
             mingw-w64-ucrt-x86_64-pkgconf
 
-      - name: Add MSYS2 toolchain to Windows PATH
+      - name: Build Release Binary on Windows (GNU Target)
         if: runner.os == 'Windows'
+        shell: msys2 {0}
         run: |
-          echo "C:\msys64\ucrt64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      - name: Build Release Binary on Windows
-        if: runner.os == 'Windows'
-        run: cargo build --release
+          cargo build --release --target x86_64-pc-windows-gnu
 
       - name: Package Windows ZIP
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          mkdir -p win_dist
-          cp target/release/rust_vault.exe win_dist/IronVault.exe
-          cp C:\msys64\ucrt64\bin\*.dll win_dist/ -ErrorAction SilentlyContinue
-          Compress-Archive -Path win_dist/* -DestinationPath IronVault-Windows.zip
+          New-Item -ItemType Directory -Force -Path win_dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-gnu/release/rust_vault.exe win_dist/IronVault.exe
+          Copy-Item C:\msys64\ucrt64\bin\*.dll win_dist/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path win_dist/* -DestinationPath IronVault-Windows.zip -Force
 
       # ------------------------------------------------------------------------
       # 4. Upload Installer Artifacts
@@ -140,7 +132,7 @@ jobs:
           if-no-files-found: error
 
   # ----------------------------------------------------------------------------
-  # 5. Publish GitHub Release (Triggers only when pushing tags like v0.1.0)
+  # 5. Publish GitHub Release
   # ----------------------------------------------------------------------------
   publish-release:
     name: Create GitHub Release
