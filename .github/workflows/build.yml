@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - main
-    tags:
-      - 'v*'
   pull_request:
     branches:
       - main
@@ -161,12 +159,12 @@ jobs:
           if-no-files-found: error
 
   # ----------------------------------------------------------------------------
-  # 5. Publish GitHub Release
+  # 5. Publish GitHub Release (Runs on code pushed to main)
   # ----------------------------------------------------------------------------
   publish-release:
     name: Create GitHub Release
     needs: build-and-package
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && !cancelled()
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -186,6 +184,10 @@ jobs:
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: latest
+          name: "IronVault Latest Release"
+          body: |
+            Continuous release build from commit ${{ github.sha }}.
           files: dist/*
           generate_release_notes: true
           draft: false
