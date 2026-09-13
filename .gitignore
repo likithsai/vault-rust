@@ -1,0 +1,7 @@
+gitignore
+/target
+**/*.rs.bk
+*.ivault
+*.db
+*.sqlite
+*.DS_Store
