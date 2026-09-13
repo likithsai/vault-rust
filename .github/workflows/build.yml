@@ -110,18 +110,24 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # 1. Prepend MSYS2 MinGW/UCRT binaries and pkg-config to PATH
+          # 1. Prepend MSYS2 MinGW/UCRT binaries and pkgconf to PATH
           $env:PATH = "C:\msys64\ucrt64\bin;C:\msys64\usr\bin;" + $env:PATH
-          $env:PKG_CONFIG_PATH = "C:\msys64\ucrt64\lib\pkgconfig"
+          
+          # 2. Configure pkg-config for cross-compilation from MSVC host to GNU target
+          $env:PKG_CONFIG = "C:\msys64\ucrt64\bin\pkg-config.exe"
+          $env:PKG_CONFIG_PATH = "C:\msys64\ucrt64\lib\pkgconfig;C:\msys64\ucrt64\share\pkgconfig"
+          $env:PKG_CONFIG_SYSROOT_DIR = "C:\msys64\ucrt64"
+          $env:PKG_CONFIG_ALLOW_CROSS = "1"
 
-          # 2. Tell the GNU linker where to find gcc/ld
+          # 3. Toolchain linkage
           $env:CC = "C:\msys64\ucrt64\bin\gcc.exe"
           $env:AR = "C:\msys64\ucrt64\bin\ar.exe"
 
-          # 3. Verify cargo is detected
+          # 4. Verify detection
+          pkg-config --modversion gtk4
           cargo --version
 
-          # 4. Build with the GNU target
+          # 5. Build binary
           cargo build --release --target x86_64-pc-windows-gnu
 
       - name: Package Windows ZIP
