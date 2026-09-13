@@ -102,28 +102,33 @@ jobs:
           msystem: UCRT64
           update: true
 
-      - name: Install GTK4 & Toolchain in MSYS2
+      - name: Install Dependencies in MSYS2
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: |
           pacman -S --noconfirm --needed \
+            make \
             mingw-w64-ucrt-x86_64-toolchain \
             mingw-w64-ucrt-x86_64-pkgconf \
-            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-gtk4 \
+            mingw-w64-ucrt-x86_64-openssl
 
       - name: Build Release Binary on Windows (GNU Target)
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: |
-          # 1. Put Windows Cargo in MSYS2 PATH
-          export PATH="/c/Users/runneradmin/.cargo/bin:$PATH"
+          # 1. Export Windows Cargo path and MSYS2 tools
+          export PATH="/c/Users/runneradmin/.cargo/bin:/usr/bin:$PATH"
 
-          # 2. Configure pkg-config
+          # 2. Configure pkg-config and OpenSSL environment
           export PKG_CONFIG_PATH="/ucrt64/lib/pkgconfig:/ucrt64/share/pkgconfig"
           export PKG_CONFIG_ALLOW_CROSS=1
+          export OPENSSL_DIR="/ucrt64"
+          export OPENSSL_NO_VENDOR=1
 
-          # 3. Verify packages inside MSYS2
+          # 3. Verify packages
           pkg-config --modversion gtk4
+          pkg-config --modversion openssl
           cargo --version
 
           # 4. Build binary
@@ -136,10 +141,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path win_dist | Out-Null
           Copy-Item target/x86_64-pc-windows-gnu/release/rust_vault.exe win_dist/IronVault.exe
 
-          # Bundle required UCRT64 GTK DLLs
+          # Bundle required UCRT64 runtime DLLs
           Copy-Item C:\msys64\ucrt64\bin\*.dll win_dist/ -ErrorAction SilentlyContinue
 
-          # Bundle GLib Schemas so GTK applications run portably
+          # Bundle GLib Schemas
           New-Item -ItemType Directory -Force -Path win_dist/share/glib-2.0/schemas | Out-Null
           Copy-Item C:\msys64\ucrt64\share\glib-2.0\schemas\* win_dist/share/glib-2.0/schemas/ -ErrorAction SilentlyContinue
 
