@@ -1,4 +1,4 @@
-name: IronVault Build & Release Pipeline
+name: IronVault Build & Package Installers
 
 on:
   push:
@@ -9,22 +9,22 @@ on:
       - main
 
 jobs:
-  build:
-    name: Build on ${{ matrix.os }}
+  build-and-package:
+    name: Build & Installers on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-latest
-            artifact_name: ironvault-macos
-            binary_path: target/release/rust_vault
+            artifact_name: ironvault-macos-installer
+            package_path: IronVault-macOS.dmg
           - os: ubuntu-latest
-            artifact_name: ironvault-linux
-            binary_path: target/release/rust_vault
+            artifact_name: ironvault-linux-deb
+            package_path: target/debian/*.deb
           - os: windows-latest
-            artifact_name: ironvault-windows
-            binary_path: target/release/rust_vault.exe
+            artifact_name: ironvault-windows-installer
+            package_path: IronVault-Windows.zip
 
     steps:
       - name: Checkout repository
@@ -46,20 +46,55 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # --- 1. macOS GTK4 Dependencies ---
-      - name: Install GTK4 on macOS
+      # ------------------------------------------------------------------------
+      # 1. macOS Setup & Build
+      # ------------------------------------------------------------------------
+      - name: Install GTK4 & Packaging Tools on macOS
         if: runner.os == 'macOS'
         run: |
-          brew install gtk4 pkg-config
+          brew install gtk4 pkg-config create-dmg
 
-      # --- 2. Linux GTK4 Dependencies ---
+      - name: Build Release Binary on macOS
+        if: runner.os == 'macOS'
+        run: cargo build --release
+
+      - name: Create macOS .dmg Installer
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dmg_root
+          cp target/release/rust_vault dmg_root/IronVault
+          chmod +x dmg_root/IronVault
+          create-dmg \
+            --volname "IronVault Installer" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --app-drop-link 450 185 \
+            "IronVault-macOS.dmg" \
+            "dmg_root/" || true
+
+      # ------------------------------------------------------------------------
+      # 2. Linux Setup & Build
+      # ------------------------------------------------------------------------
       - name: Install GTK4 on Linux
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev build-essential pkg-config libssl-dev
 
-      # --- 3. Windows MSYS2 & GTK4 Setup ---
+      - name: Install cargo-deb tool
+        if: runner.os == 'Linux'
+        run: cargo install cargo-deb || true
+
+      - name: Build and Package .deb on Linux
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release
+          cargo deb --no-build
+
+      # ------------------------------------------------------------------------
+      # 3. Windows Setup & Build
+      # ------------------------------------------------------------------------
       - name: Set up MSYS2 on Windows
         if: runner.os == 'Windows'
         uses: msys2/setup-msys2@v2
@@ -76,14 +111,26 @@ jobs:
         run: |
           echo "C:\msys64\ucrt64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      # --- 4. Build Release Binary ---
-      - name: Compile Release Binary
+      - name: Build Release Binary on Windows
+        if: runner.os == 'Windows'
         run: cargo build --release
 
-      # --- 5. Upload Build Artifact ---
-      - name: Upload Artifact
+      - name: Package Windows Portable/Installer ZIP
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          mkdir -p win_dist
+          cp target/release/rust_vault.exe win_dist/IronVault.exe
+          # Bundle essential GTK/GLib DLLs into package
+          cp C:\msys64\ucrt64\bin\*.dll win_dist/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path win_dist/* -DestinationPath IronVault-Windows.zip
+
+      # ------------------------------------------------------------------------
+      # 4. Upload Installers as Artifacts
+      # ------------------------------------------------------------------------
+      - name: Upload Installer Packages
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.binary_path }}
+          path: ${{ matrix.package_path }}
           if-no-files-found: error

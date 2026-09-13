@@ -15,3 +15,16 @@ open = "5.3"
 [dependencies.rusqlite]
 version = "0.32"
 features = ["bundled-sqlcipher-vendored-openssl", "uuid"]
+
+[package.metadata.deb]
+name = "ironvault"
+maintainer = "likithsai <likithsai@example.com>"
+copyright = "2026, likithsai"
+license-file = ["LICENSE", "4"]
+extended-description = "IronVault Pro Secure Encrypted Archive Utility"
+depends = "$auto, libgtk-4-1"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/rust_vault", "usr/bin/ironvault", "755"],
+]
