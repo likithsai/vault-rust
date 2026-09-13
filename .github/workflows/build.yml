@@ -4,26 +4,31 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
   pull_request:
     branches:
       - main
 
+permissions:
+  contents: write
+
 jobs:
   build-and-package:
-    name: Build & Installers on ${{ matrix.os }}
+    name: Build & Package on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-latest
-            artifact_name: ironvault-macos-installer
+            artifact_name: ironvault-macos
             package_path: IronVault-macOS.dmg
           - os: ubuntu-latest
-            artifact_name: ironvault-linux-deb
+            artifact_name: ironvault-linux
             package_path: target/debian/*.deb
           - os: windows-latest
-            artifact_name: ironvault-windows-installer
+            artifact_name: ironvault-windows
             package_path: IronVault-Windows.zip
 
     steps:
@@ -47,7 +52,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       # ------------------------------------------------------------------------
-      # 1. macOS Setup & Build
+      # 1. macOS Build & DMG Package
       # ------------------------------------------------------------------------
       - name: Install GTK4 & Packaging Tools on macOS
         if: runner.os == 'macOS'
@@ -74,7 +79,7 @@ jobs:
             "dmg_root/" || true
 
       # ------------------------------------------------------------------------
-      # 2. Linux Setup & Build
+      # 2. Linux Build & DEB Package
       # ------------------------------------------------------------------------
       - name: Install GTK4 on Linux
         if: runner.os == 'Linux'
@@ -93,7 +98,7 @@ jobs:
           cargo deb --no-build
 
       # ------------------------------------------------------------------------
-      # 3. Windows Setup & Build
+      # 3. Windows Build & Portable ZIP Package
       # ------------------------------------------------------------------------
       - name: Set up MSYS2 on Windows
         if: runner.os == 'Windows'
@@ -115,18 +120,17 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo build --release
 
-      - name: Package Windows Portable/Installer ZIP
+      - name: Package Windows ZIP
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           mkdir -p win_dist
           cp target/release/rust_vault.exe win_dist/IronVault.exe
-          # Bundle essential GTK/GLib DLLs into package
           cp C:\msys64\ucrt64\bin\*.dll win_dist/ -ErrorAction SilentlyContinue
           Compress-Archive -Path win_dist/* -DestinationPath IronVault-Windows.zip
 
       # ------------------------------------------------------------------------
-      # 4. Upload Installers as Artifacts
+      # 4. Upload Installer Artifacts
       # ------------------------------------------------------------------------
       - name: Upload Installer Packages
         uses: actions/upload-artifact@v4
@@ -134,3 +138,36 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.package_path }}
           if-no-files-found: error
+
+  # ----------------------------------------------------------------------------
+  # 5. Publish GitHub Release (Triggers only when pushing tags like v0.1.0)
+  # ----------------------------------------------------------------------------
+  publish-release:
+    name: Create GitHub Release
+    needs: build-and-package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all built packages
+        uses: actions/download-artifact@v4
+        with:
+          path: release_assets
+
+      - name: Prepare release files
+        run: |
+          mkdir -p dist
+          find release_assets/ -type f \( -name "*.dmg" -o -name "*.deb" -o -name "*.zip" \) -exec cp {} dist/ \;
+          ls -lh dist/
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
