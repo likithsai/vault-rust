@@ -93,7 +93,7 @@ jobs:
           cargo deb --no-build
 
       # ------------------------------------------------------------------------
-      # 3. Windows Build & Packaging (MSYS2 + GNU toolchain)
+      # 3. Windows Build & Packaging (MSYS2 Native Environment)
       # ------------------------------------------------------------------------
       - name: Set up MSYS2 on Windows
         if: runner.os == 'Windows'
@@ -101,34 +101,32 @@ jobs:
         with:
           msystem: UCRT64
           update: true
-          install: >-
-            mingw-w64-ucrt-x86_64-toolchain
-            mingw-w64-ucrt-x86_64-pkgconf
+
+      - name: Install GTK4 & Toolchain in MSYS2
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          pacman -S --noconfirm --needed \
+            mingw-w64-ucrt-x86_64-toolchain \
+            mingw-w64-ucrt-x86_64-pkgconf \
             mingw-w64-ucrt-x86_64-gtk4
 
       - name: Build Release Binary on Windows (GNU Target)
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: msys2 {0}
         run: |
-          # 1. Remove Strawberry Perl from PATH to prevent pkg-config collision
-          $filteredPath = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'Strawberry' }) -join ';'
-          $env:PATH = "C:\msys64\ucrt64\bin;C:\msys64\usr\bin;" + $filteredPath
+          # 1. Put Windows Cargo in MSYS2 PATH
+          export PATH="/c/Users/runneradmin/.cargo/bin:$PATH"
 
-          # 2. Tell Cargo and pkg-config-rs to use MSYS2 pkgconf
-          $env:PKG_CONFIG = "C:/msys64/ucrt64/bin/pkgconf.exe"
-          $env:PKG_CONFIG_PATH = "C:/msys64/ucrt64/lib/pkgconfig;C:/msys64/ucrt64/share/pkgconfig"
-          $env:PKG_CONFIG_ALLOW_CROSS = "1"
-          $env:PKG_CONFIG_SYSROOT_DIR = "C:/msys64/ucrt64"
+          # 2. Configure pkg-config
+          export PKG_CONFIG_PATH="/ucrt64/lib/pkgconfig:/ucrt64/share/pkgconfig"
+          export PKG_CONFIG_ALLOW_CROSS=1
 
-          # 3. GNU Linker and Archiver configuration
-          $env:CC = "C:/msys64/ucrt64/bin/gcc.exe"
-          $env:AR = "C:/msys64/ucrt64/bin/ar.exe"
+          # 3. Verify packages inside MSYS2
+          pkg-config --modversion gtk4
+          cargo --version
 
-          # 4. Verify gtk-4 and pkgconf detection
-          & "C:/msys64/ucrt64/bin/pkgconf.exe" --modversion gtk4
-          & "C:/msys64/ucrt64/bin/pkgconf.exe" --libs --cflags glib-2.0
-
-          # 5. Build binary
+          # 4. Build binary
           cargo build --release --target x86_64-pc-windows-gnu
 
       - name: Package Windows ZIP
