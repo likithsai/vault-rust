@@ -102,30 +102,31 @@ jobs:
           msystem: UCRT64
           update: true
           install: >-
-            mingw-w64-ucrt-x86_64-gtk4
             mingw-w64-ucrt-x86_64-toolchain
             mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-gtk4
 
       - name: Build Release Binary on Windows (GNU Target)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # 1. Prepend MSYS2 MinGW/UCRT binaries and pkgconf to PATH
-          $env:PATH = "C:\msys64\ucrt64\bin;C:\msys64\usr\bin;" + $env:PATH
-          
-          # 2. Configure pkg-config for cross-compilation from MSVC host to GNU target
-          $env:PKG_CONFIG = "C:\msys64\ucrt64\bin\pkg-config.exe"
-          $env:PKG_CONFIG_PATH = "C:\msys64\ucrt64\lib\pkgconfig;C:\msys64\ucrt64\share\pkgconfig"
-          $env:PKG_CONFIG_SYSROOT_DIR = "C:\msys64\ucrt64"
+          # 1. Remove Strawberry Perl from PATH to prevent pkg-config collision
+          $filteredPath = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'Strawberry' }) -join ';'
+          $env:PATH = "C:\msys64\ucrt64\bin;C:\msys64\usr\bin;" + $filteredPath
+
+          # 2. Tell Cargo and pkg-config-rs to use MSYS2 pkgconf
+          $env:PKG_CONFIG = "C:/msys64/ucrt64/bin/pkgconf.exe"
+          $env:PKG_CONFIG_PATH = "C:/msys64/ucrt64/lib/pkgconfig;C:/msys64/ucrt64/share/pkgconfig"
           $env:PKG_CONFIG_ALLOW_CROSS = "1"
+          $env:PKG_CONFIG_SYSROOT_DIR = "C:/msys64/ucrt64"
 
-          # 3. Toolchain linkage
-          $env:CC = "C:\msys64\ucrt64\bin\gcc.exe"
-          $env:AR = "C:\msys64\ucrt64\bin\ar.exe"
+          # 3. GNU Linker and Archiver configuration
+          $env:CC = "C:/msys64/ucrt64/bin/gcc.exe"
+          $env:AR = "C:/msys64/ucrt64/bin/ar.exe"
 
-          # 4. Verify detection
-          pkg-config --modversion gtk4
-          cargo --version
+          # 4. Verify gtk-4 and pkgconf detection
+          & "C:/msys64/ucrt64/bin/pkgconf.exe" --modversion gtk4
+          & "C:/msys64/ucrt64/bin/pkgconf.exe" --libs --cflags glib-2.0
 
           # 5. Build binary
           cargo build --release --target x86_64-pc-windows-gnu
@@ -136,7 +137,14 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path win_dist | Out-Null
           Copy-Item target/x86_64-pc-windows-gnu/release/rust_vault.exe win_dist/IronVault.exe
+
+          # Bundle required UCRT64 GTK DLLs
           Copy-Item C:\msys64\ucrt64\bin\*.dll win_dist/ -ErrorAction SilentlyContinue
+
+          # Bundle GLib Schemas so GTK applications run portably
+          New-Item -ItemType Directory -Force -Path win_dist/share/glib-2.0/schemas | Out-Null
+          Copy-Item C:\msys64\ucrt64\share\glib-2.0\schemas\* win_dist/share/glib-2.0/schemas/ -ErrorAction SilentlyContinue
+
           Compress-Archive -Path win_dist/* -DestinationPath IronVault-Windows.zip -Force
 
       # ------------------------------------------------------------------------
