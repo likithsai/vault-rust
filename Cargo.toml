@@ -2,7 +2,7 @@
 name = "rust_vault"
 version = "0.1.0"
 edition = "2021"
-description = "IronVault Enterprise encrypted archive utility"
+description = "IronVault Pro Secure Encrypted Archive Utility"
 license = "MIT"
 
 [dependencies]
@@ -14,24 +14,25 @@ zstd = "0.13"
 blake3 = "1.5"
 open = "5.3"
 
-[package.metadata.bundle]
-name = "Vault Video Optimizer"
-identifier = "com.vault.video_optimizer"
-icon = ["32x32.png", "128x128.png", "128x128@2x.png"]
-version = "0.1.0"
-copyright = "2026 Vault Studio"
-category = "Video"
-short_description = "Hardware-accelerated video batch optimizer"
-long_description = "High-throughput parallel video compressor using hardware acceleration (VideoToolbox, NVENC, QSV)."
-
 [dependencies.rusqlite]
 version = "0.32"
-features = ["bundled-sqlcipher-vendored-openssl", "uuid"]
+features = ["bundled-sqlcipher", "uuid"]
+
+[package.metadata.bundle]
+name = "IronVault"
+identifier = "com.ironvault.desktop"
+icon = ["32x32.png", "128x128.png", "128x128@2x.png"]
+version = "0.1.0"
+copyright = "2026 IronVault Contributors"
+category = "Utility"
+short_description = "Encrypted archive utility"
+long_description = "IronVault Pro Secure Encrypted Archive Utility with Zstd and SQLCipher."
 
 [package.metadata.deb]
 name = "ironvault"
 maintainer = "likithsai <likithsai@example.com>"
 copyright = "2026, likithsai"
+license-file = ["LICENSE", "4"]
 extended-description = "IronVault Pro Secure Encrypted Archive Utility"
 depends = "$auto, libgtk-4-1"
 section = "utils"

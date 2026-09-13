@@ -5,7 +5,7 @@ use gtk4::prelude::*;
 use gtk4::{CssProvider, DropTarget};
 use relm4::factory::FactoryVecDeque;
 use relm4::prelude::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -74,6 +74,16 @@ where
     }
 }
 
+fn clean_path<P: AsRef<Path>>(path: P) -> PathBuf {
+    let p = path.as_ref();
+    let s = p.to_string_lossy();
+    if s.starts_with(r"\\?\") {
+        PathBuf::from(&s[4..])
+    } else {
+        p.to_path_buf()
+    }
+}
+
 fn parse_uri_list(uri_data: &str) -> Vec<PathBuf> {
     uri_data
         .lines()
@@ -82,7 +92,7 @@ fn parse_uri_list(uri_data: &str) -> Vec<PathBuf> {
         .filter_map(|uri_str| {
             let file = gio::File::for_uri(uri_str);
             if let Some(path) = file.path() {
-                return Some(path);
+                return Some(clean_path(path));
             }
 
             if let Some(stripped) = uri_str.strip_prefix("file://") {
@@ -92,17 +102,16 @@ fn parse_uri_list(uri_data: &str) -> Vec<PathBuf> {
 
                 #[cfg(target_os = "windows")]
                 {
-                    let win_path = if unescaped.starts_with('/') && unescaped.chars().nth(2) == Some(':') {
-                        &unescaped[1..]
-                    } else {
-                        &unescaped
-                    };
-                    return Some(PathBuf::from(win_path.replace('/', "\\")));
+                    let trimmed = unescaped.trim_start_matches('/');
+                    if trimmed.len() >= 2 && trimmed.chars().nth(1) == Some(':') {
+                        return Some(clean_path(trimmed.replace('/', "\\")));
+                    }
+                    return Some(clean_path(unescaped.replace('/', "\\")));
                 }
 
                 #[cfg(not(target_os = "windows"))]
                 {
-                    return Some(PathBuf::from(unescaped));
+                    return Some(clean_path(unescaped));
                 }
             }
             None
@@ -114,7 +123,6 @@ const WINZIP_CSS: &str = "
 window {
     background-color: #2b2d30;
     color: #dfdfdf;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, 'Noto Sans', 'Cantarell', sans-serif;
     font-size: 13px;
 }
 .ribbon-bar {
@@ -541,7 +549,38 @@ impl SimpleComponent for VaultModel {
                         add_css_class: "ribbon-btn",
                         #[watch]
                         set_sensitive: !model.is_loading,
-                        connect_clicked[sender] => move |_| { sender.input(VaultMsg::PromptCreateVault); },
+                        connect_clicked[sender, main_window] => move |_| {
+                            let chooser = gtk::FileChooserNative::new(
+                                Some("New Zstd Encrypted Archive (.ivault)"),
+                                Some(&main_window),
+                                gtk::FileChooserAction::Save,
+                                Some("Create"),
+                                Some("Cancel"),
+                            );
+                            chooser.set_current_name("Archive.ivault");
+
+                            let s = sender.clone();
+                            let win = main_window.clone();
+                            chooser.connect_response(move |dialog, res| {
+                                if res == gtk::ResponseType::Accept {
+                                    if let Some(file) = dialog.file() {
+                                        if let Some(raw_path) = file.path() {
+                                            let path = clean_path(raw_path);
+                                            spawn_password_dialog(
+                                                "Set Master Key",
+                                                "Set archive encryption password:",
+                                                Some(&win),
+                                                s.clone(),
+                                                move |pwd, snd| {
+                                                    snd.input(VaultMsg::ExecuteUnlock(path.clone(), pwd, true));
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                            chooser.show();
+                        },
                         gtk::Box {
                             set_orientation: gtk::Orientation::Vertical,
                             set_halign: gtk::Align::Center,
@@ -553,7 +592,37 @@ impl SimpleComponent for VaultModel {
                         add_css_class: "ribbon-btn",
                         #[watch]
                         set_sensitive: !model.is_loading,
-                        connect_clicked[sender] => move |_| { sender.input(VaultMsg::PromptOpenVault); },
+                        connect_clicked[sender, main_window] => move |_| {
+                            let chooser = gtk::FileChooserNative::new(
+                                Some("Open Encrypted Archive"),
+                                Some(&main_window),
+                                gtk::FileChooserAction::Open,
+                                Some("Open"),
+                                Some("Cancel"),
+                            );
+
+                            let s = sender.clone();
+                            let win = main_window.clone();
+                            chooser.connect_response(move |dialog, res| {
+                                if res == gtk::ResponseType::Accept {
+                                    if let Some(file) = dialog.file() {
+                                        if let Some(raw_path) = file.path() {
+                                            let path = clean_path(raw_path);
+                                            spawn_password_dialog(
+                                                "Enter Password",
+                                                "Enter archive password:",
+                                                Some(&win),
+                                                s.clone(),
+                                                move |pwd, snd| {
+                                                    snd.input(VaultMsg::ExecuteUnlock(path.clone(), pwd, false));
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                            chooser.show();
+                        },
                         gtk::Box {
                             set_orientation: gtk::Orientation::Vertical,
                             set_halign: gtk::Align::Center,
@@ -590,7 +659,27 @@ impl SimpleComponent for VaultModel {
                         add_css_class: "ribbon-btn",
                         #[watch]
                         set_sensitive: model.db.is_some() && !model.is_loading,
-                        connect_clicked[sender] => move |_| { sender.input(VaultMsg::PromptAddFile); },
+                        connect_clicked[sender, main_window] => move |_| {
+                            let chooser = gtk::FileChooserNative::new(
+                                Some("Add Files"),
+                                Some(&main_window),
+                                gtk::FileChooserAction::Open,
+                                Some("Add"),
+                                Some("Cancel"),
+                            );
+
+                            let s = sender.clone();
+                            chooser.connect_response(move |dialog, res| {
+                                if res == gtk::ResponseType::Accept {
+                                    if let Some(file) = dialog.file() {
+                                        if let Some(raw_path) = file.path() {
+                                            s.input(VaultMsg::ImportFilesList(vec![clean_path(raw_path)]));
+                                        }
+                                    }
+                                }
+                            });
+                            chooser.show();
+                        },
                         gtk::Box {
                             set_orientation: gtk::Orientation::Vertical,
                             set_halign: gtk::Align::Center,
@@ -627,7 +716,17 @@ impl SimpleComponent for VaultModel {
                         add_css_class: "ribbon-btn",
                         #[watch]
                         set_sensitive: model.db.is_some() && !model.is_loading,
-                        connect_clicked[sender] => move |_| { sender.input(VaultMsg::PromptChangePassword); },
+                        connect_clicked[sender, main_window] => move |_| {
+                            spawn_password_dialog(
+                                "Rekey Archive",
+                                "Enter new master password:",
+                                Some(&main_window),
+                                sender.clone(),
+                                move |new_pwd, snd| {
+                                    snd.input(VaultMsg::ExecuteRekey(new_pwd));
+                                },
+                            );
+                        },
                         gtk::Box {
                             set_orientation: gtk::Orientation::Vertical,
                             set_halign: gtk::Align::Center,
@@ -962,6 +1061,7 @@ impl SimpleComponent for VaultModel {
                     .files()
                     .into_iter()
                     .filter_map(|f| f.path())
+                    .map(clean_path)
                     .collect();
 
                 if !paths.is_empty() {
@@ -972,7 +1072,7 @@ impl SimpleComponent for VaultModel {
 
             if let Ok(file) = value.get::<gio::File>() {
                 if let Some(path) = file.path() {
-                    s_drop.input(VaultMsg::ImportFilesList(vec![path]));
+                    s_drop.input(VaultMsg::ImportFilesList(vec![clean_path(path)]));
                     return true;
                 }
             }
@@ -1004,64 +1104,10 @@ impl SimpleComponent for VaultModel {
 
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         match msg {
-            VaultMsg::PromptCreateVault => {
-                let chooser = gtk::FileChooserNative::new(
-                    Some("New Zstd Encrypted Archive (.ivault)"),
-                    gtk::Window::NONE,
-                    gtk::FileChooserAction::Save,
-                    Some("Create"),
-                    Some("Cancel"),
-                );
-                chooser.set_current_name("Archive.ivault");
-
-                let s = sender.clone();
-                chooser.connect_response(move |dialog, res| {
-                    if res == gtk::ResponseType::Accept {
-                        if let Some(file) = dialog.file() {
-                            if let Some(path) = file.path() {
-                                spawn_password_dialog(
-                                    "Set Master Key",
-                                    "Set archive encryption password:",
-                                    s.clone(),
-                                    move |pwd, snd| {
-                                        snd.input(VaultMsg::ExecuteUnlock(path.clone(), pwd, true));
-                                    },
-                                );
-                            }
-                        }
-                    }
-                });
-                chooser.show();
-            }
-
-            VaultMsg::PromptOpenVault => {
-                let chooser = gtk::FileChooserNative::new(
-                    Some("Open Encrypted Archive"),
-                    gtk::Window::NONE,
-                    gtk::FileChooserAction::Open,
-                    Some("Open"),
-                    Some("Cancel"),
-                );
-
-                let s = sender.clone();
-                chooser.connect_response(move |dialog, res| {
-                    if res == gtk::ResponseType::Accept {
-                        if let Some(file) = dialog.file() {
-                            if let Some(path) = file.path() {
-                                spawn_password_dialog(
-                                    "Enter Password",
-                                    "Enter archive password:",
-                                    s.clone(),
-                                    move |pwd, snd| {
-                                        snd.input(VaultMsg::ExecuteUnlock(path.clone(), pwd, false));
-                                    },
-                                );
-                            }
-                        }
-                    }
-                });
-                chooser.show();
-            }
+            VaultMsg::PromptCreateVault => {}
+            VaultMsg::PromptOpenVault => {}
+            VaultMsg::PromptAddFile => {}
+            VaultMsg::PromptChangePassword => {}
 
             VaultMsg::ExecuteUnlock(path, password, is_new) => {
                 self.is_loading = true;
@@ -1175,18 +1221,6 @@ impl SimpleComponent for VaultModel {
                 sender.input(VaultMsg::LoadCurrentDirectory);
             }
 
-            VaultMsg::PromptChangePassword => {
-                let s = sender.clone();
-                spawn_password_dialog(
-                    "Rekey Archive",
-                    "Enter new master password:",
-                    s.clone(),
-                    move |new_pwd, snd| {
-                        snd.input(VaultMsg::ExecuteRekey(new_pwd));
-                    },
-                );
-            }
-
             VaultMsg::ExecuteRekey(new_pwd) => {
                 if let Some(db_arc) = self.db.clone() {
                     let s = sender.clone();
@@ -1268,7 +1302,7 @@ impl SimpleComponent for VaultModel {
                         let size = meta.size;
                         let comp_size = meta.compressed_size;
                         let hash = meta.checksum.clone();
-                        let created_at = meta.created_at; // <-- Extract as owned value here
+                        let created_at = meta.created_at;
                         let is_img = is_previewable_image(&name);
                         let s = sender.clone();
                         let db_opt = self.db.clone();
@@ -1285,7 +1319,7 @@ impl SimpleComponent for VaultModel {
                                     format_bytes(size),
                                     format_bytes(comp_size),
                                     if hash.is_empty() { "None" } else { &hash[..12] },
-                                    format_timestamp(created_at) // <-- Use created_at instead of meta.created_at
+                                    format_timestamp(created_at)
                                 );
 
                                 s.input(VaultMsg::PreviewLoaded(name, summary, data, is_img));
@@ -1341,7 +1375,8 @@ impl SimpleComponent for VaultModel {
                     chooser.connect_response(move |dialog, res| {
                         if res == gtk::ResponseType::Accept {
                             if let Some(file) = dialog.file() {
-                                if let Some(target) = file.path() {
+                                if let Some(raw_target) = file.path() {
+                                    let target = clean_path(raw_target);
                                     let src = active_path.clone();
                                     let task_s = s.clone();
 
@@ -1392,28 +1427,6 @@ impl SimpleComponent for VaultModel {
                 });
             }
 
-            VaultMsg::PromptAddFile => {
-                let chooser = gtk::FileChooserNative::new(
-                    Some("Add Files"),
-                    gtk::Window::NONE,
-                    gtk::FileChooserAction::Open,
-                    Some("Add"),
-                    Some("Cancel"),
-                );
-
-                let s = sender.clone();
-                chooser.connect_response(move |dialog, res| {
-                    if res == gtk::ResponseType::Accept {
-                        if let Some(file) = dialog.file() {
-                            if let Some(path) = file.path() {
-                                s.input(VaultMsg::ImportFilesList(vec![path]));
-                            }
-                        }
-                    }
-                });
-                chooser.show();
-            }
-
             VaultMsg::ImportFilesList(paths) => {
                 if let Some(db_arc) = self.db.clone() {
                     let folder_id = self.current_folder_id;
@@ -1441,7 +1454,7 @@ impl SimpleComponent for VaultModel {
 
                                 if let Ok(entries) = std::fs::read_dir(path) {
                                     for entry in entries.flatten() {
-                                        let child_path = entry.path();
+                                        let child_path = clean_path(entry.path());
                                         ingest_path(db, &child_path, Some(new_folder_id), task_sender)?;
                                     }
                                 }
@@ -1605,7 +1618,8 @@ impl SimpleComponent for VaultModel {
                             chooser.connect_response(move |dialog, res| {
                                 if res == gtk::ResponseType::Accept {
                                     if let Some(file) = dialog.file() {
-                                        if let Some(path) = file.path() {
+                                        if let Some(raw_path) = file.path() {
+                                            let path = clean_path(raw_path);
                                             if let Some(db_arc) = db_opt.clone() {
                                                 let task_s = s.clone();
                                                 task_s.input(VaultMsg::SetStatus(format!("Decompressing '{}'...", name)));
@@ -1717,11 +1731,25 @@ fn spawn_error_dialog(title: &str, message: &str) {
     dialog.present();
 }
 
-fn spawn_password_dialog<F>(title: &str, prompt: &str, sender: ComponentSender<VaultModel>, on_submit: F)
-where
+fn spawn_password_dialog<F>(
+    title: &str,
+    prompt: &str,
+    parent: Option<&gtk::Window>,
+    sender: ComponentSender<VaultModel>,
+    on_submit: F,
+) where
     F: Fn(String, ComponentSender<VaultModel>) + 'static,
 {
-    let dialog = gtk::Window::builder().title(title).modal(true).default_width(360).build();
+    let dialog = gtk::Window::builder()
+        .title(title)
+        .modal(true)
+        .default_width(360)
+        .build();
+
+    if let Some(p) = parent {
+        dialog.set_transient_for(Some(p));
+    }
+
     let root_box = gtk::Box::new(gtk::Orientation::Vertical, 10);
     root_box.set_margin_all(16);
 
@@ -1748,11 +1776,20 @@ where
     dialog.present();
 }
 
-fn spawn_entry_dialog<F>(title: &str, prompt: &str, initial_val: &str, on_submit: F)
-where
+fn spawn_entry_dialog<F>(
+    title: &str,
+    prompt: &str,
+    initial_val: &str,
+    on_submit: F,
+) where
     F: Fn(String) + 'static,
 {
-    let dialog = gtk::Window::builder().title(title).modal(true).default_width(360).build();
+    let dialog = gtk::Window::builder()
+        .title(title)
+        .modal(true)
+        .default_width(360)
+        .build();
+
     let root_box = gtk::Box::new(gtk::Orientation::Vertical, 10);
     root_box.set_margin_all(16);
 

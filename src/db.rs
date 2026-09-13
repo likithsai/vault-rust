@@ -3,7 +3,7 @@ use rusqlite::{params, Connection, Result, Row};
 use std::fmt;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -58,17 +58,28 @@ pub struct VaultStats {
     pub compressed_bytes: usize,
 }
 
+fn sanitize_db_path<P: AsRef<Path>>(path: P) -> PathBuf {
+    let p_ref = path.as_ref();
+    let s = p_ref.to_string_lossy();
+    if s.starts_with(r"\\?\") {
+        PathBuf::from(&s[4..])
+    } else {
+        p_ref.to_path_buf()
+    }
+}
+
 impl EncryptedDb {
     pub fn open<P: AsRef<Path>>(path: P, key: &str) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        let clean_path = sanitize_db_path(path);
+        let conn = Connection::open(&clean_path)?;
 
         conn.pragma_update(None, "key", key)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "mmap_size", 536870912)?;
-        conn.pragma_update(None, "cache_size", -128000)?;
+        let _ = conn.pragma_update(None, "mmap_size", 268435456);
+        let _ = conn.pragma_update(None, "cache_size", -64000);
         conn.pragma_update(None, "temp_store", "MEMORY")?;
         conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
 
@@ -361,7 +372,8 @@ impl EncryptedDb {
     where
         F: FnMut(usize, usize),
     {
-        let f = File::create(target_path)
+        let clean_path = sanitize_db_path(target_path);
+        let f = File::create(clean_path)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         let mut writer = BufWriter::with_capacity(1024 * 1024, f);
 
@@ -486,6 +498,20 @@ impl EncryptedDb {
                 params![file_size, comp_size],
             )?;
         } else {
+            tx.execute(
+                "WITH RECURSIVE subfolders(fid) AS (
+                    SELECT id FROM folders WHERE id = ?1
+                    UNION ALL
+                    SELECT f.id FROM folders f JOIN subfolders s ON f.parent_id = s.fid
+                )
+                UPDATE vault_stats SET 
+                    total_files = total_files - (SELECT COUNT(*) FROM files WHERE folder_id IN (SELECT fid FROM subfolders)),
+                    total_bytes = total_bytes - COALESCE((SELECT SUM(size) FROM files WHERE folder_id IN (SELECT fid FROM subfolders)), 0),
+                    compressed_bytes = compressed_bytes - COALESCE((SELECT SUM(compressed_size) FROM files WHERE folder_id IN (SELECT fid FROM subfolders)), 0)
+                WHERE id = 1",
+                params![id.as_bytes()],
+            )?;
+
             tx.execute("DELETE FROM folders WHERE id = ?1", params![id.as_bytes()])?;
         }
 
