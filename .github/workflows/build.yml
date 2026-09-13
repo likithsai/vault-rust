@@ -83,8 +83,8 @@ jobs:
       - name: Install pre-built cargo-deb
         if: runner.os == 'Linux'
         run: |
-          curl -LsSf https://github.com/cargo-bins/cargo-binstall/releases/latest/download/cargo-binstall-x86_64-unknown-linux-musl.tgz | tar -xvz -C /usr/local/bin
-          cargo-binstall -y --no-confirm cargo-deb
+          curl -LsSf https://github.com/cargo-bins/cargo-binstall/releases/latest/download/cargo-binstall-x86_64-unknown-linux-musl.tgz | sudo tar -xvz -C /usr/local/bin
+          cargo-binstall --no-confirm cargo-deb
 
       - name: Build and Package .deb on Linux
         if: runner.os == 'Linux'
