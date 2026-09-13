@@ -108,8 +108,20 @@ jobs:
 
       - name: Build Release Binary on Windows (GNU Target)
         if: runner.os == 'Windows'
-        shell: msys2 {0}
+        shell: pwsh
         run: |
+          # 1. Prepend MSYS2 MinGW/UCRT binaries and pkg-config to PATH
+          $env:PATH = "C:\msys64\ucrt64\bin;C:\msys64\usr\bin;" + $env:PATH
+          $env:PKG_CONFIG_PATH = "C:\msys64\ucrt64\lib\pkgconfig"
+
+          # 2. Tell the GNU linker where to find gcc/ld
+          $env:CC = "C:\msys64\ucrt64\bin\gcc.exe"
+          $env:AR = "C:\msys64\ucrt64\bin\ar.exe"
+
+          # 3. Verify cargo is detected
+          cargo --version
+
+          # 4. Build with the GNU target
           cargo build --release --target x86_64-pc-windows-gnu
 
       - name: Package Windows ZIP
