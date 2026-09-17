@@ -844,7 +844,7 @@ impl SimpleComponent for VaultModel {
                     add_css_class: "path-bar",
 
                     gtk::Button {
-                        set_label: "⬆️ Up",
+                        set_label: "⬆️",
                         add_css_class: "ribbon-btn",
                         #[watch]
                         set_sensitive: model.current_folder_id.is_some() && !model.is_loading,
