@@ -695,7 +695,7 @@ impl SimpleComponent for VaultModel {
                             set_orientation: gtk::Orientation::Vertical,
                             set_halign: gtk::Align::Center,
                             gtk::Label { set_text: "💾", add_css_class: "ribbon-icon" },
-                            gtk::Label { set_text: "Backup", add_css_class: "ribbon-text" }
+                            gtk::Label { set_text: "Save", add_css_class: "ribbon-text" }
                         }
                     },
                     gtk::Separator { set_orientation: gtk::Orientation::Vertical, add_css_class: "ribbon-sep" },
@@ -823,9 +823,9 @@ impl SimpleComponent for VaultModel {
                     gtk::Box { set_hexpand: true },
 
                     gtk::SearchEntry {
-                        set_width_request: 220,
+                        set_hexpand: true,
                         add_css_class: "search-entry",
-                        set_placeholder_text: Some("Filter archive (Ctrl+F)..."),
+                        set_placeholder_text: Some("Search for files"),
                         connect_search_changed[sender] => move |entry| {
                             sender.input(VaultMsg::SetSearchQuery(entry.text().to_string()));
                         }
@@ -834,6 +834,8 @@ impl SimpleComponent for VaultModel {
                     gtk::Spinner {
                         #[watch]
                         set_spinning: model.is_loading,
+                        #[watch]
+                        set_visible: model.is_loading, // Collapses the widget space when not active
                     }
                 },
 
@@ -844,13 +846,12 @@ impl SimpleComponent for VaultModel {
                     add_css_class: "path-bar",
 
                     gtk::Button {
-                        set_label: "⬆️ Up",
+                        set_label: "⬆️",
                         add_css_class: "ribbon-btn",
                         #[watch]
                         set_sensitive: model.current_folder_id.is_some() && !model.is_loading,
                         connect_clicked[sender] => move |_| { sender.input(VaultMsg::NavigateUp); }
                     },
-                    gtk::Label { set_text: "Location:" },
                     gtk::Entry {
                         set_hexpand: true,
                         set_editable: false,
