@@ -5,12 +5,15 @@ use gtk4::prelude::*;
 use gtk4::{CssProvider, DropTarget};
 use relm4::factory::FactoryVecDeque;
 use relm4::prelude::*;
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 mod db;
-use db::{EncryptedDb, FileMetadata, FolderMetadata, SortColumn, SortDirection, VaultStats};
+use db::{EncryptedDb, FileMetadata, FolderMetadata, SortColumn, SortDirection, VaultStats, CHUNK_SIZE};
 
 const PAGE_SIZE: usize = 500;
 
@@ -82,6 +85,21 @@ fn clean_path<P: AsRef<Path>>(path: P) -> PathBuf {
     } else {
         p.to_path_buf()
     }
+}
+
+fn compute_file_hash_binary<P: AsRef<Path>>(path: P) -> std::io::Result<[u8; 32]> {
+    let f = File::open(path)?;
+    let mut reader = BufReader::with_capacity(CHUNK_SIZE, f);
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(*hasher.finalize().as_bytes())
 }
 
 fn parse_uri_list(uri_data: &str) -> Vec<PathBuf> {
@@ -249,6 +267,28 @@ window {
 }
 .error-btn:hover {
     background-color: #ffffff;
+}
+.duplicate-btn-skip {
+    background-color: #45475a;
+    color: #cdd6f4;
+    font-weight: bold;
+    border-radius: 4px;
+    padding: 4px 14px;
+    border: none;
+}
+.duplicate-btn-skip:hover {
+    background-color: #585b70;
+}
+.duplicate-btn-keep {
+    background-color: #89b4fa;
+    color: #11111b;
+    font-weight: bold;
+    border-radius: 4px;
+    padding: 4px 14px;
+    border: none;
+}
+.duplicate-btn-keep:hover {
+    background-color: #b4befe;
 }
 ";
 
@@ -485,6 +525,9 @@ struct VaultModel {
     preview_has_image: bool,
     preview_texture: Option<Texture>,
     show_preview_pane: bool,
+
+    // Ingestion queue for processing and prompting duplicates sequentially
+    import_queue: VecDeque<(PathBuf, Option<Uuid>)>,
 }
 
 #[derive(Debug)]
@@ -501,6 +544,19 @@ enum VaultMsg {
     PromptCreateFolder,
     PromptAddFile,
     ImportFilesList(Vec<PathBuf>),
+    ProcessNextImportQueue,
+    PromptDuplicateEncountered {
+        path: PathBuf,
+        folder_id: Option<Uuid>,
+        existing_file_name: String,
+    },
+    ResolveDuplicate {
+        path: PathBuf,
+        folder_id: Option<Uuid>,
+        keep: bool,
+    },
+    CommitSingleFileImport(PathBuf, Option<Uuid>),
+
     SelectEntry(Option<usize>),
     ActivateEntry(usize),
     NavigateUp,
@@ -647,7 +703,12 @@ impl SimpleComponent for VaultModel {
                         add_css_class: "ribbon-btn",
                         #[watch]
                         set_sensitive: model.db.is_some() && !model.is_loading,
-                        connect_clicked[sender] => move |_| { sender.input(VaultMsg::PromptCreateFolder); },
+                        connect_clicked[sender, main_window] => move |_| {
+                            let s = sender.clone();
+                            spawn_entry_dialog("New Folder", "Folder name:", "NewFolder", Some(&main_window), move |_name| {
+                                s.input(VaultMsg::PromptCreateFolder);
+                            });
+                        },
                         gtk::Box {
                             set_orientation: gtk::Orientation::Vertical,
                             set_halign: gtk::Align::Center,
@@ -1038,6 +1099,7 @@ impl SimpleComponent for VaultModel {
             preview_has_image: false,
             preview_texture: None,
             show_preview_pane: false,
+            import_queue: VecDeque::new(),
         };
 
         let file_list_box = model.entries.widget();
@@ -1403,101 +1465,164 @@ impl SimpleComponent for VaultModel {
                 self.selected_index = None;
                 self.show_preview_pane = false;
                 self.stats = VaultStats::default();
+                self.import_queue.clear();
                 self.status = "Archive locked".into();
             }
 
             VaultMsg::PromptCreateFolder => {
-                let s = sender.clone();
                 let db_opt = self.db.clone();
                 let parent_id = self.current_folder_id;
+                let s = sender.clone();
 
-                spawn_entry_dialog("New Folder", "Folder name:", "NewFolder", move |name| {
-                    if let Some(db_arc) = db_opt.clone() {
-                        let task_s = s.clone();
+                if let Some(db_arc) = db_opt {
+                    tokio::task::spawn_blocking(move || {
+                        let result = run_on_db(&db_arc, move |db| {
+                            db.create_folder("NewFolder", parent_id)
+                        });
+                        match result {
+                            Ok(_) => s.input(VaultMsg::LoadCurrentDirectory),
+                            Err(e) => s.input(VaultMsg::SetError(e)),
+                        }
+                    });
+                }
+            }
+
+            // --- INGESTION & PARALLEL DEDUPLICATION QUEUE ---
+            VaultMsg::ImportFilesList(paths) => {
+                if self.db.is_none() {
+                    sender.input(VaultMsg::SetError("Unlock or create an archive before dropping items.".into()));
+                    return;
+                }
+
+                let folder_id = self.current_folder_id;
+                fn expand_paths(p: PathBuf, parent_fid: Option<Uuid>, out: &mut VecDeque<(PathBuf, Option<Uuid>)>) {
+                    if p.is_dir() {
+                        if let Ok(entries) = std::fs::read_dir(&p) {
+                            for entry in entries.flatten() {
+                                expand_paths(clean_path(entry.path()), parent_fid, out);
+                            }
+                        }
+                    } else if p.is_file() {
+                        out.push_back((p, parent_fid));
+                    }
+                }
+
+                for path in paths {
+                    expand_paths(path, folder_id, &mut self.import_queue);
+                }
+
+                sender.input(VaultMsg::ProcessNextImportQueue);
+            }
+
+            VaultMsg::ProcessNextImportQueue => {
+                if let Some((path, folder_id)) = self.import_queue.pop_front() {
+                    if let Some(db_arc) = self.db.clone() {
+                        self.is_loading = true;
+                        let s = sender.clone();
+
                         tokio::task::spawn_blocking(move || {
-                            let result = run_on_db(&db_arc, move |db| {
-                                db.create_folder(&name, parent_id)
-                            });
-                            match result {
-                                Ok(_) => task_s.input(VaultMsg::LoadCurrentDirectory),
-                                Err(e) => task_s.input(VaultMsg::SetError(e)),
+                            let file_hash_res = compute_file_hash_binary(&path);
+                            match file_hash_res {
+                                Ok(hash_bytes) => {
+                                    let existing_file_opt = run_on_db(&db_arc, |db| {
+                                        db.find_existing_file_by_hash(&hash_bytes)
+                                    }).unwrap_or(None);
+
+                                    if let Some(existing_name) = existing_file_opt {
+                                        s.input(VaultMsg::PromptDuplicateEncountered {
+                                            path,
+                                            folder_id,
+                                            existing_file_name: existing_name,
+                                        });
+                                    } else {
+                                        s.input(VaultMsg::CommitSingleFileImport(path, folder_id));
+                                    }
+                                }
+                                Err(e) => {
+                                    s.input(VaultMsg::SetError(format!("Failed reading file {}: {}", path.display(), e)));
+                                    s.input(VaultMsg::ProcessNextImportQueue);
+                                }
                             }
                         });
                     }
-                });
+                } else {
+                    self.is_loading = false;
+                    self.progress_fraction = 0.0;
+                    self.status = "All items processed.".into();
+                    if let Some(db_arc) = self.db.clone() {
+                        if let Ok(stats) = run_on_db(&db_arc, |db| db.get_vault_stats()) {
+                            self.stats = stats;
+                        }
+                    }
+                    sender.input(VaultMsg::LoadCurrentDirectory);
+                }
             }
 
-            VaultMsg::ImportFilesList(paths) => {
-                if let Some(db_arc) = self.db.clone() {
-                    let folder_id = self.current_folder_id;
-                    let task_s = sender.clone();
+            VaultMsg::PromptDuplicateEncountered { path, folder_id, existing_file_name } => {
+                let file_name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
 
-                    self.is_loading = true;
-                    self.progress_fraction = 0.0;
-                    self.status = "Compressing & encrypting...".into();
+                let s = sender.clone();
+                let path_clone = path.clone();
+                spawn_duplicate_alert_dialog(
+                    &file_name,
+                    &existing_file_name,
+                    move |keep| {
+                        s.input(VaultMsg::ResolveDuplicate {
+                            path: path_clone.clone(),
+                            folder_id,
+                            keep,
+                        });
+                    },
+                );
+            }
+
+            VaultMsg::ResolveDuplicate { path, folder_id, keep } => {
+                if keep {
+                    sender.input(VaultMsg::CommitSingleFileImport(path, folder_id));
+                } else {
+                    self.status = format!("Skipped duplicate: {}", path.file_name().unwrap_or_default().to_string_lossy());
+                    sender.input(VaultMsg::ProcessNextImportQueue);
+                }
+            }
+
+            VaultMsg::CommitSingleFileImport(path, folder_id) => {
+                if let Some(db_arc) = self.db.clone() {
+                    let s = sender.clone();
+                    let file_name = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
 
                     tokio::task::spawn_blocking(move || {
-                        fn ingest_path(
-                            db: &mut EncryptedDb,
-                            path: &PathBuf,
-                            parent_fid: Option<Uuid>,
-                            task_sender: &ComponentSender<VaultModel>,
-                        ) -> rusqlite::Result<()> {
-                            if path.is_dir() {
-                                let dir_name = path
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .to_string();
-
-                                let new_folder_id = db.create_folder(&dir_name, parent_fid)?;
-
-                                if let Ok(entries) = std::fs::read_dir(path) {
-                                    for entry in entries.flatten() {
-                                        let child_path = clean_path(entry.path());
-                                        ingest_path(db, &child_path, Some(new_folder_id), task_sender)?;
-                                    }
-                                }
-                            } else if path.is_file() {
-                                let file_name = path
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .to_string();
-
-                                let s_prog = task_sender.clone();
-                                db.stream_insert_file(path, parent_fid, |done, total| {
-                                    let pct = if total > 0 { done as f64 / total as f64 } else { 1.0 };
-                                    let msg = format!(
-                                        "Compressing: {} ({} / {})",
-                                        file_name,
-                                        format_bytes(done),
-                                        format_bytes(total)
-                                    );
-                                    s_prog.input(VaultMsg::UpdateProgress(pct, msg));
-                                })?;
-                            }
-                            Ok(())
-                        }
-
-                        let task_s_work = task_s.clone();
-                        let run_result = run_on_db(&db_arc, move |db| {
-                            for path in &paths {
-                                ingest_path(db, path, folder_id, &task_s_work)?;
-                            }
-                            db.get_vault_stats()
+                        let s_prog = s.clone();
+                        let res = run_on_db(&db_arc, move |db| {
+                            db.stream_insert_file(&path, folder_id, |done, total| {
+                                let pct = if total > 0 { done as f64 / total as f64 } else { 1.0 };
+                                let msg = format!(
+                                    "Deduplicating & Ingesting: {} ({} / {})",
+                                    file_name,
+                                    format_bytes(done),
+                                    format_bytes(total)
+                                );
+                                s_prog.input(VaultMsg::UpdateProgress(pct, msg));
+                            })
                         });
 
-                        match run_result {
-                            Ok(stats) => {
-                                task_s.input(VaultMsg::SetStatus(format!("Imported successfully. Vault has {} items.", stats.total_files)));
-                                task_s.input(VaultMsg::LoadCurrentDirectory);
+                        match res {
+                            Ok(_) => {
+                                s.input(VaultMsg::ProcessNextImportQueue);
                             }
-                            Err(e) => task_s.input(VaultMsg::SetError(format!("Import error: {}", e))),
+                            Err(e) => {
+                                s.input(VaultMsg::SetError(format!("Import error: {}", e)));
+                                s.input(VaultMsg::ProcessNextImportQueue);
+                            }
                         }
                     });
-                } else {
-                    sender.input(VaultMsg::SetError("Unlock or create an archive before dropping items.".into()));
                 }
             }
 
@@ -1549,7 +1674,7 @@ impl SimpleComponent for VaultModel {
                         let db_opt = self.db.clone();
                         let s = sender.clone();
 
-                        spawn_entry_dialog("Rename", "New name:", &name, move |new_name| {
+                        spawn_entry_dialog("Rename", "New name:", &name, gtk::Window::NONE, move |new_name| {
                             if let Some(db_arc) = db_opt.clone() {
                                 let task_s = s.clone();
                                 let name_clone = new_name.clone();
@@ -1674,6 +1799,84 @@ impl SimpleComponent for VaultModel {
 
 // --- MODAL DIALOGS ---
 
+fn spawn_duplicate_alert_dialog<F>(new_name: &str, existing_name: &str, on_decision: F)
+where
+    F: Fn(bool) + 'static,
+{
+    let dialog = gtk::Window::builder()
+        .title("Duplicate File Detected")
+        .modal(true)
+        .default_width(420)
+        .resizable(false)
+        .build();
+
+    let root_box = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    root_box.set_margin_all(20);
+
+    let content_box = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+    content_box.set_valign(gtk::Align::Center);
+
+    let icon_label = gtk::Label::new(Some("📑"));
+    icon_label.set_css_classes(&["entry-icon"]);
+    icon_label.set_valign(gtk::Align::Start);
+
+    let text_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    text_box.set_hexpand(true);
+
+    let header_label = gtk::Label::new(Some("Duplicate File"));
+    header_label.set_xalign(0.0);
+    header_label.set_css_classes(&["error-dialog-title"]);
+
+    let desc_label = gtk::Label::new(Some(&format!(
+        "The file '{}' has the exact same cryptographic contents as '{}' already in this vault.\n\nDue to BLAKE3 deduplication, keeping it will reference the existing chunks without consuming additional storage.",
+        new_name, existing_name
+    )));
+    desc_label.set_xalign(0.0);
+    desc_label.set_wrap(true);
+    desc_label.set_max_width_chars(44);
+    desc_label.set_css_classes(&["error-dialog-msg"]);
+
+    text_box.append(&header_label);
+    text_box.append(&desc_label);
+
+    content_box.append(&icon_label);
+    content_box.append(&text_box);
+
+    let btn_box = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    btn_box.set_halign(gtk::Align::End);
+
+    let skip_btn = gtk::Button::with_label("Skip File");
+    skip_btn.set_css_classes(&["duplicate-btn-skip"]);
+
+    let keep_btn = gtk::Button::with_label("Keep Duplicate");
+    keep_btn.set_css_classes(&["duplicate-btn-keep"]);
+
+    let on_dec = Arc::new(on_decision);
+
+    let dlg_clone1 = dialog.clone();
+    let dec_clone1 = on_dec.clone();
+    skip_btn.connect_clicked(move |_| {
+        dec_clone1(false);
+        dlg_clone1.close();
+    });
+
+    let dlg_clone2 = dialog.clone();
+    let dec_clone2 = on_dec.clone();
+    keep_btn.connect_clicked(move |_| {
+        dec_clone2(true);
+        dlg_clone2.close();
+    });
+
+    btn_box.append(&skip_btn);
+    btn_box.append(&keep_btn);
+
+    root_box.append(&content_box);
+    root_box.append(&btn_box);
+
+    dialog.set_child(Some(&root_box));
+    dialog.present();
+}
+
 fn spawn_error_dialog(title: &str, message: &str) {
     let dialog = gtk::Window::builder()
         .title(title)
@@ -1780,6 +1983,7 @@ fn spawn_entry_dialog<F>(
     title: &str,
     prompt: &str,
     initial_val: &str,
+    parent: Option<&gtk::Window>,
     on_submit: F,
 ) where
     F: Fn(String) + 'static,
@@ -1789,6 +1993,10 @@ fn spawn_entry_dialog<F>(
         .modal(true)
         .default_width(360)
         .build();
+
+    if let Some(p) = parent {
+        dialog.set_transient_for(Some(p));
+    }
 
     let root_box = gtk::Box::new(gtk::Orientation::Vertical, 10);
     root_box.set_margin_all(16);
