@@ -4,8 +4,10 @@ use std::fmt;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+pub const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB
 
 pub struct EncryptedDb {
     conn: Connection,
@@ -76,10 +78,11 @@ impl EncryptedDb {
         conn.pragma_update(None, "key", key)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
+        // High-performance WAL & Memory optimizations
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        let _ = conn.pragma_update(None, "mmap_size", 268435456);
-        let _ = conn.pragma_update(None, "cache_size", -64000);
+        let _ = conn.pragma_update(None, "mmap_size", 268435456); // 256 MB memory-mapped I/O
+        let _ = conn.pragma_update(None, "cache_size", -128000);  // 128 MB cache
         conn.pragma_update(None, "temp_store", "MEMORY")?;
         conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
 
@@ -98,16 +101,25 @@ impl EncryptedDb {
                 compressed_size INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 folder_id BLOB,
-                checksum TEXT NOT NULL DEFAULT '',
+                checksum BLOB NOT NULL,
                 FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE CASCADE
             );
 
+            -- Global deduplicated unique compressed blocks
             CREATE TABLE IF NOT EXISTS chunks (
+                chunk_hash BLOB PRIMARY KEY,
+                data BLOB NOT NULL,
+                ref_count INTEGER NOT NULL DEFAULT 1
+            );
+
+            -- Mapping table between files and deduplicated chunks
+            CREATE TABLE IF NOT EXISTS file_chunks (
                 file_id BLOB NOT NULL,
                 chunk_index INTEGER NOT NULL,
-                data BLOB NOT NULL,
+                chunk_hash BLOB NOT NULL,
                 PRIMARY KEY (file_id, chunk_index),
-                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+                FOREIGN KEY (chunk_hash) REFERENCES chunks(chunk_hash)
             );
 
             CREATE TABLE IF NOT EXISTS vault_stats (
@@ -120,7 +132,8 @@ impl EncryptedDb {
 
             CREATE INDEX IF NOT EXISTS idx_folders_nav ON folders(parent_id, name);
             CREATE INDEX IF NOT EXISTS idx_files_covering ON files(folder_id, name, size, compressed_size, created_at);
-            CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);"
+            CREATE INDEX IF NOT EXISTS idx_files_checksum ON files(checksum);
+            CREATE INDEX IF NOT EXISTS idx_file_chunks_lookup ON file_chunks(file_id, chunk_index);"
         )?;
 
         let _ = conn.query_row("SELECT id FROM vault_stats WHERE id = 1", [], |_| Ok(()))?;
@@ -149,6 +162,16 @@ impl EncryptedDb {
         )
     }
 
+    pub fn find_existing_file_by_hash(&self, checksum_bytes: &[u8]) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare_cached("SELECT name FROM files WHERE checksum = ?1 LIMIT 1")?;
+        let mut rows = stmt.query(params![checksum_bytes])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn parse_folder(row: &Row) -> Result<FolderMetadata> {
         let id_bytes: Vec<u8> = row.get(0)?;
         let pid_bytes: Option<Vec<u8>> = row.get(2)?;
@@ -162,6 +185,17 @@ impl EncryptedDb {
     fn parse_file(row: &Row) -> Result<FileMetadata> {
         let id_bytes: Vec<u8> = row.get(0)?;
         let fid_bytes: Option<Vec<u8>> = row.get(5)?;
+        let hash_bytes: Vec<u8> = row.get(6)?;
+
+        // Format bytes as lowercase hex string without external crate
+        let checksum_hex = hash_bytes
+            .iter()
+            .fold(String::with_capacity(hash_bytes.len() * 2), |mut acc, b| {
+                use std::fmt::Write;
+                let _ = write!(acc, "{:02x}", b);
+                acc
+            });
+
         Ok(FileMetadata {
             id: Uuid::from_slice(&id_bytes).unwrap_or_default(),
             name: row.get(1)?,
@@ -169,14 +203,14 @@ impl EncryptedDb {
             compressed_size: row.get(3)?,
             created_at: row.get(4)?,
             folder_id: fid_bytes.and_then(|b| Uuid::from_slice(&b).ok()),
-            checksum: row.get(6)?,
+            checksum: checksum_hex,
         })
     }
 
     pub fn list_folders(&self, parent_id: Option<Uuid>) -> Result<Vec<FolderMetadata>> {
         let mut stmt = match parent_id {
-            Some(_) => self.conn.prepare("SELECT id, name, parent_id FROM folders WHERE parent_id = ?1 ORDER BY name ASC")?,
-            None => self.conn.prepare("SELECT id, name, parent_id FROM folders WHERE parent_id IS NULL ORDER BY name ASC")?,
+            Some(_) => self.conn.prepare_cached("SELECT id, name, parent_id FROM folders WHERE parent_id = ?1 ORDER BY name ASC")?,
+            None => self.conn.prepare_cached("SELECT id, name, parent_id FROM folders WHERE parent_id IS NULL ORDER BY name ASC")?,
         };
 
         let rows = match parent_id {
@@ -270,7 +304,6 @@ impl EncryptedDb {
     where
         F: FnMut(usize, usize),
     {
-        const CHUNK_SIZE: usize = 1024 * 1024;
         let file_path = source_path.as_ref();
         let name = file_path
             .file_name()
@@ -292,33 +325,43 @@ impl EncryptedDb {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        let mut hasher = Hasher::new();
+        let mut file_hasher = Hasher::new();
         let mut total_compressed = 0;
 
         let tx = self.conn.transaction()?;
 
         tx.execute(
             "INSERT INTO files (id, name, size, compressed_size, created_at, folder_id, checksum) 
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, X'') ",
             params![
                 file_id.as_bytes(),
                 name,
                 total_size,
-                0,
                 created_at,
                 folder_id.map(|id| id.as_bytes().to_vec()),
-                ""
             ],
         )?;
 
         {
-            let mut chunk_stmt = tx.prepare(
-                "INSERT INTO chunks (file_id, chunk_index, data) VALUES (?1, ?2, ?3)"
+            let mut check_chunk_stmt = tx.prepare_cached(
+                "SELECT length(data) FROM chunks WHERE chunk_hash = ?1"
             )?;
 
+            let mut insert_chunk_stmt = tx.prepare_cached(
+                "INSERT INTO chunks (chunk_hash, data, ref_count) VALUES (?1, ?2, 1)
+                 ON CONFLICT(chunk_hash) DO UPDATE SET ref_count = ref_count + 1"
+            )?;
+
+            let mut link_chunk_stmt = tx.prepare_cached(
+                "INSERT INTO file_chunks (file_id, chunk_index, chunk_hash) VALUES (?1, ?2, ?3)"
+            )?;
+
+            // Reusable buffers to minimize allocations across the pipeline
             let mut buffer = vec![0u8; CHUNK_SIZE];
+            let mut compressed_buf = Vec::with_capacity(CHUNK_SIZE);
             let mut chunk_index = 0;
             let mut bytes_processed = 0;
+            let mut last_emit = Instant::now();
 
             loop {
                 let bytes_read = reader
@@ -328,29 +371,56 @@ impl EncryptedDb {
                     break;
                 }
 
-                hasher.update(&buffer[..bytes_read]);
+                let current_slice = &buffer[..bytes_read];
+                file_hasher.update(current_slice);
 
-                let compressed = zstd::encode_all(&buffer[..bytes_read], 3)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-                total_compressed += compressed.len();
+                // Compute binary 32-byte chunk hash
+                let chunk_hash = blake3::hash(current_slice);
+                let chunk_hash_bytes = chunk_hash.as_bytes();
 
-                chunk_stmt.execute(params![
+                // Check if identical block exists to avoid running compression
+                let mut existing_rows = check_chunk_stmt.query(params![chunk_hash_bytes])?;
+                if let Some(row) = existing_rows.next()? {
+                    let existing_compressed_len: usize = row.get(0)?;
+                    total_compressed += existing_compressed_len;
+
+                    // Increment reference counter
+                    insert_chunk_stmt.execute(params![chunk_hash_bytes, &[] as &[u8]])?;
+                } else {
+                    compressed_buf.clear();
+                    zstd::stream::copy_encode(current_slice, &mut compressed_buf, 3)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+                    total_compressed += compressed_buf.len();
+
+                    insert_chunk_stmt.execute(params![
+                        chunk_hash_bytes,
+                        &compressed_buf
+                    ])?;
+                }
+
+                link_chunk_stmt.execute(params![
                     file_id.as_bytes(),
                     chunk_index,
-                    compressed
+                    chunk_hash_bytes
                 ])?;
 
                 bytes_processed += bytes_read;
                 chunk_index += 1;
-                progress_cb(bytes_processed, total_size);
+
+                // Throttle progress dispatching to avoid event-loop congestion (max 60Hz)
+                if last_emit.elapsed() >= Duration::from_millis(16) || bytes_processed == total_size {
+                    progress_cb(bytes_processed, total_size);
+                    last_emit = Instant::now();
+                }
             }
         }
 
-        let checksum = hasher.finalize().to_hex().to_string();
+        let full_checksum = file_hasher.finalize();
 
         tx.execute(
             "UPDATE files SET compressed_size = ?1, checksum = ?2 WHERE id = ?3",
-            params![total_compressed, checksum, file_id.as_bytes()],
+            params![total_compressed, full_checksum.as_bytes(), file_id.as_bytes()],
         )?;
 
         tx.execute(
@@ -375,25 +445,38 @@ impl EncryptedDb {
         let clean_path = sanitize_db_path(target_path);
         let f = File::create(clean_path)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-        let mut writer = BufWriter::with_capacity(1024 * 1024, f);
+        let mut writer = BufWriter::with_capacity(CHUNK_SIZE, f);
 
-        let mut stmt = self.conn.prepare(
-            "SELECT data FROM chunks WHERE file_id = ?1 ORDER BY chunk_index ASC"
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT c.data 
+             FROM file_chunks fc
+             JOIN chunks c ON fc.chunk_hash = c.chunk_hash
+             WHERE fc.file_id = ?1 
+             ORDER BY fc.chunk_index ASC"
         )?;
         let mut rows = stmt.query(params![file_id.as_bytes()])?;
 
         let mut bytes_processed = 0;
+        let mut raw_buf = Vec::with_capacity(CHUNK_SIZE);
+        let mut last_emit = Instant::now();
+
         while let Some(row) = rows.next()? {
             let compressed_chunk: Vec<u8> = row.get(0)?;
-            let raw_chunk = zstd::decode_all(&compressed_chunk[..])
+            raw_buf.clear();
+
+            zstd::stream::copy_decode(&compressed_chunk[..], &mut raw_buf)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
 
             writer
-                .write_all(&raw_chunk)
+                .write_all(&raw_buf)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
 
-            bytes_processed += raw_chunk.len();
-            progress_cb(bytes_processed, total_size);
+            bytes_processed += raw_buf.len();
+
+            if last_emit.elapsed() >= Duration::from_millis(16) || bytes_processed == total_size {
+                progress_cb(bytes_processed, total_size);
+                last_emit = Instant::now();
+            }
         }
 
         writer
@@ -403,8 +486,12 @@ impl EncryptedDb {
     }
 
     pub fn load_file_preview_bytes(&self, file_id: Uuid, max_bytes: usize) -> Result<Vec<u8>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT data FROM chunks WHERE file_id = ?1 ORDER BY chunk_index ASC"
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT c.data 
+             FROM file_chunks fc
+             JOIN chunks c ON fc.chunk_hash = c.chunk_hash
+             WHERE fc.file_id = ?1 
+             ORDER BY fc.chunk_index ASC"
         )?;
         let mut rows = stmt.query(params![file_id.as_bytes()])?;
         let mut collected = Vec::new();
@@ -430,32 +517,39 @@ impl EncryptedDb {
         let mut stmt = self.conn.prepare("SELECT id, name, checksum FROM files")?;
         let rows = stmt.query_map([], |r| {
             let id_b: Vec<u8> = r.get(0)?;
+            let chk_b: Vec<u8> = r.get(2)?;
             Ok((
                 Uuid::from_slice(&id_b).unwrap_or_default(),
                 r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
+                chk_b,
             ))
         })?;
 
         let file_list: Vec<_> = rows.filter_map(|x| x.ok()).collect();
         let total = file_list.len();
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(total);
 
         for (i, (fid, name, stored_hash)) in file_list.into_iter().enumerate() {
             progress_cb(i + 1, total, &name);
 
-            let mut chunk_stmt = self.conn.prepare(
-                "SELECT data FROM chunks WHERE file_id = ?1 ORDER BY chunk_index ASC"
+            let mut chunk_stmt = self.conn.prepare_cached(
+                "SELECT c.data 
+                 FROM file_chunks fc
+                 JOIN chunks c ON fc.chunk_hash = c.chunk_hash
+                 WHERE fc.file_id = ?1 
+                 ORDER BY fc.chunk_index ASC"
             )?;
             let mut chunk_rows = chunk_stmt.query(params![fid.as_bytes()])?;
             let mut hasher = Hasher::new();
             let mut valid = true;
+            let mut buf = Vec::with_capacity(CHUNK_SIZE);
 
             while let Some(cr) = chunk_rows.next()? {
                 let compressed: Vec<u8> = cr.get(0)?;
-                match zstd::decode_all(&compressed[..]) {
-                    Ok(decompressed) => {
-                        hasher.update(&decompressed);
+                buf.clear();
+                match zstd::stream::copy_decode(&compressed[..], &mut buf) {
+                    Ok(_) => {
+                        hasher.update(&buf);
                     }
                     Err(_) => {
                         valid = false;
@@ -465,8 +559,8 @@ impl EncryptedDb {
             }
 
             if valid {
-                let computed = hasher.finalize().to_hex().to_string();
-                results.push((name, computed == stored_hash));
+                let computed = hasher.finalize();
+                results.push((name, computed.as_bytes() == stored_hash.as_slice()));
             } else {
                 results.push((name, false));
             }
@@ -492,6 +586,14 @@ impl EncryptedDb {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             ).unwrap_or((0, 0));
 
+            tx.execute(
+                "UPDATE chunks 
+                 SET ref_count = ref_count - 1 
+                 WHERE chunk_hash IN (SELECT chunk_hash FROM file_chunks WHERE file_id = ?1)",
+                params![id.as_bytes()],
+            )?;
+
+            tx.execute("DELETE FROM chunks WHERE ref_count <= 0", [])?;
             tx.execute("DELETE FROM files WHERE id = ?1", params![id.as_bytes()])?;
             tx.execute(
                 "UPDATE vault_stats SET total_files = total_files - 1, total_bytes = total_bytes - ?1, compressed_bytes = compressed_bytes - ?2 WHERE id = 1",
@@ -512,6 +614,24 @@ impl EncryptedDb {
                 params![id.as_bytes()],
             )?;
 
+            tx.execute(
+                "WITH RECURSIVE subfolders(fid) AS (
+                    SELECT id FROM folders WHERE id = ?1
+                    UNION ALL
+                    SELECT f.id FROM folders f JOIN subfolders s ON f.parent_id = s.fid
+                )
+                UPDATE chunks 
+                SET ref_count = ref_count - 1 
+                WHERE chunk_hash IN (
+                    SELECT fc.chunk_hash 
+                    FROM file_chunks fc 
+                    JOIN files f ON fc.file_id = f.id 
+                    WHERE f.folder_id IN (SELECT fid FROM subfolders)
+                )",
+                params![id.as_bytes()],
+            )?;
+
+            tx.execute("DELETE FROM chunks WHERE ref_count <= 0", [])?;
             tx.execute("DELETE FROM folders WHERE id = ?1", params![id.as_bytes()])?;
         }
 
